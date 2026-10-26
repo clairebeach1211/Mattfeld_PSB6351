@@ -33,6 +33,11 @@ work_dir = '/home/cbeac004/Mattfeld_PSB6351/preproc_assignment'
 sink_dir = os.path.join(base_dir, 'derivatives/preproc')
 fs_dir = '/home/amattfel/Mattfeld_PSB6351/derivatives/freesurfer'
 
+# Set to True to use FreeSurfer (bbregister + aparc+aseg brain mask).
+# I don't have read access to the FreeSurfer outputs above yet, so for now the
+# brain mask is made directly from the EPI reference volume with AFNI's 3dAutomask.
+use_freesurfer = False
+
 # Function for extracting slice timing info from fMRI json sidecars
 def slc_time(json_file_list):
     import json
@@ -173,13 +178,15 @@ psb6351_wf.connect(volreg, 'out_file', tshifter, 'in_file')
 psb6351_wf.connect(getslctime, 'slctime_list', tshifter, 'slice_timing')
 
 # NODE 10: Coregistration of functional to anatomical node using freesurfer's bbregister
-fs_register = pe.Node(fs.BBRegister(init='fsl'),
-                      name ='fs_register')
-fs_register.inputs.contrast_type = 't2'
-fs_register.inputs.out_fsl_file = True
-fs_register.inputs.subjects_dir = fs_dir
-psb6351_wf.connect(subjID_infosource, 'subject_id', fs_register, 'subject_id')
-psb6351_wf.connect(extractref, 'roi_file', fs_register, 'source_file')
+#          (only when use_freesurfer is True)
+if use_freesurfer:
+    fs_register = pe.Node(fs.BBRegister(init='fsl'),
+                          name ='fs_register')
+    fs_register.inputs.contrast_type = 't2'
+    fs_register.inputs.out_fsl_file = True
+    fs_register.inputs.subjects_dir = fs_dir
+    psb6351_wf.connect(subjID_infosource, 'subject_id', fs_register, 'subject_id')
+    psb6351_wf.connect(extractref, 'roi_file', fs_register, 'source_file')
 
 # BIG NOTE: A lot of the steps that you'll start doing now require a 
 #           hefty amount of memory. Your nodes may crash without very
@@ -287,28 +294,39 @@ fwhm_list = [3, 6, 9, 12]
 # NODES FOR SPATIAL SMOOTHING GO HERE!!!!
 # I chose the FSL SUSAN approach
 
-# SUSAN NODE 1: FreeSurferSource to grab the subject's recon-all outputs
-fssource = pe.Node(nio.FreeSurferSource(),
-                   name='fssource')
-fssource.inputs.subjects_dir = fs_dir
-psb6351_wf.connect(subjID_infosource, 'subject_id', fssource, 'subject_id')
+if use_freesurfer:
+    # SUSAN NODE 1: FreeSurferSource to grab the subject's recon-all outputs
+    fssource = pe.Node(nio.FreeSurferSource(),
+                       name='fssource')
+    fssource.inputs.subjects_dir = fs_dir
+    psb6351_wf.connect(subjID_infosource, 'subject_id', fssource, 'subject_id')
 
-# SUSAN NODE 2: Binarize the aparc+aseg (> 0.5) to get a brain only mask
-#               in T1w space and dilate it by 1 voxel
-fs_threshold = pe.Node(fs.Binarize(min=0.5, dilate=1, out_type='nii.gz'),
-                       name='fs_threshold')
-psb6351_wf.connect(fssource, ('aparc_aseg', get_aparc_aseg), fs_threshold, 'in_file')
+    # SUSAN NODE 2: Binarize the aparc+aseg (> 0.5) to get a brain only mask
+    #               in T1w space and dilate it by 1 voxel
+    fs_threshold = pe.Node(fs.Binarize(min=0.5, dilate=1, out_type='nii.gz'),
+                           name='fs_threshold')
+    psb6351_wf.connect(fssource, ('aparc_aseg', get_aparc_aseg), fs_threshold, 'in_file')
 
-# SUSAN NODE 3: Move the brain mask from T1w space into EPI space
-#               bbregister registered EPI -> T1w, so apply the inverse.
-#               source_file = where we are going (EPI reference volume)
-#               target_file = what is moving (T1w brain mask)
-fs_voltransform = pe.Node(fs.ApplyVolTransform(inverse=True, interp='nearest'),
-                          name='fs_voltransform')
-fs_voltransform.inputs.subjects_dir = fs_dir
-psb6351_wf.connect(extractref, 'roi_file', fs_voltransform, 'source_file')
-psb6351_wf.connect(fs_register, 'out_reg_file', fs_voltransform, 'reg_file')
-psb6351_wf.connect(fs_threshold, 'binary_file', fs_voltransform, 'target_file')
+    # SUSAN NODE 3: Move the brain mask from T1w space into EPI space
+    #               bbregister registered EPI -> T1w, so apply the inverse.
+    #               source_file = where we are going (EPI reference volume)
+    #               target_file = what is moving (T1w brain mask)
+    fs_voltransform = pe.Node(fs.ApplyVolTransform(inverse=True, interp='nearest'),
+                              name='fs_voltransform')
+    fs_voltransform.inputs.subjects_dir = fs_dir
+    psb6351_wf.connect(extractref, 'roi_file', fs_voltransform, 'source_file')
+    psb6351_wf.connect(fs_register, 'out_reg_file', fs_voltransform, 'reg_file')
+    psb6351_wf.connect(fs_threshold, 'binary_file', fs_voltransform, 'target_file')
+    mask_node, mask_field = fs_voltransform, 'transformed_file'
+else:
+    # Without FreeSurfer: make the brain mask straight from the EPI reference
+    # volume with AFNI's 3dAutomask (dilated by 1 voxel). Every run was motion
+    # corrected to this volume, so the mask is already in EPI space and no
+    # transform/interpolation is needed.
+    automask = pe.Node(afni.Automask(outputtype='NIFTI_GZ', dilate=1),
+                       name='automask')
+    psb6351_wf.connect(extractref, 'roi_file', automask, 'in_file')
+    mask_node, mask_field = automask, 'out_file'
 
 # SUSAN NODE 4: Mask each motion + slicetime corrected run with the EPI space brain mask
 maskfunc = pe.MapNode(fsl.ImageMaths(op_string='-mas', suffix='_bet'),
@@ -316,7 +334,7 @@ maskfunc = pe.MapNode(fsl.ImageMaths(op_string='-mas', suffix='_bet'),
                       name='maskfunc')
 maskfunc.plugin_args = highmem_args
 psb6351_wf.connect(tshifter, 'out_file', maskfunc, 'in_file')
-psb6351_wf.connect(fs_voltransform, 'transformed_file', maskfunc, 'in_file2')
+psb6351_wf.connect(mask_node, mask_field, maskfunc, 'in_file2')
 
 # SUSAN NODE 5: Median value within the brain mask for each run
 #               (fslstats -k mask -p 50)
@@ -325,7 +343,7 @@ medianval = pe.MapNode(fsl.ImageStats(op_string='-k %s -p 50'),
                        name='medianval')
 medianval.plugin_args = highmem_args
 psb6351_wf.connect(tshifter, 'out_file', medianval, 'in_file')
-psb6351_wf.connect(fs_voltransform, 'transformed_file', medianval, 'mask_file')
+psb6351_wf.connect(mask_node, mask_field, medianval, 'mask_file')
 
 # SUSAN NODE 6: Mean functional image for each masked run
 meanfunc = pe.MapNode(fsl.ImageMaths(op_string='-Tmean', suffix='_mean'),
@@ -429,14 +447,15 @@ psb6351_wf.connect(extractref, 'roi_file', datasink, 'study_ref')
 psb6351_wf.connect(volreg, 'out_file', datasink, 'motion.@corrfile')
 psb6351_wf.connect(volreg, 'oned_matrix_save', datasink, 'motion.@matrix')
 psb6351_wf.connect(volreg, 'oned_file', datasink, 'motion.@par')
-psb6351_wf.connect(fs_register, 'out_reg_file', datasink, 'register.@reg_file')
-psb6351_wf.connect(fs_register, 'min_cost_file', datasink, 'register.@reg_cost')
-psb6351_wf.connect(fs_register, 'out_fsl_file', datasink, 'register.@reg_fsl_file')
+if use_freesurfer:
+    psb6351_wf.connect(fs_register, 'out_reg_file', datasink, 'register.@reg_file')
+    psb6351_wf.connect(fs_register, 'min_cost_file', datasink, 'register.@reg_cost')
+    psb6351_wf.connect(fs_register, 'out_fsl_file', datasink, 'register.@reg_fsl_file')
 
 # ADD datasink connections to save spatially smoothed and temporally filtered data
 # if you implemented more than one method for diadatic purposes...save accordingly
 # Smoothed and filtered outputs land in a _fwhm_<size> folder per kernel
-psb6351_wf.connect(fs_voltransform, 'transformed_file', datasink, 'mask.@epi_mask')
+psb6351_wf.connect(mask_node, mask_field, datasink, 'mask.@epi_mask')
 psb6351_wf.connect(maskfunc, 'out_file', datasink, 'masked_func')
 psb6351_wf.connect(smooth, 'smoothed_file', datasink, 'smooth')
 psb6351_wf.connect(highpass, 'out_file', datasink, 'hpfilter')
